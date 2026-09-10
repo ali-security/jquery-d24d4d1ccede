@@ -1,0 +1,242 @@
+name: Seal Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build and pack jquery 1.11.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The CDN copy script and the container build script are written into
+      # RUNNER_TEMP, never into the checkout: the published tarball must not
+      # gain any extra entry, and edits under build/ are dropped from the
+      # version patch.
+      #
+      # Heredoc bodies below use SPACES ONLY. A tab-indented heredoc body makes
+      # this YAML unparseable, and the only symptom is the workflow silently
+      # disappearing from the patch target list.
+      - name: Write the CDN copy script
+        run: |
+          mkdir -p "$RUNNER_TEMP/seal"
+          cat > "$RUNNER_TEMP/seal/make-cdn-copies.js" <<'EOF'
+          // Reproduces makeReleaseCopies() from build/release.js, which is only
+          // reachable through the interactive `grunt release` flow. Produces the
+          // nine dist/cdn/* files that ship in the published tarball.
+          //
+          // ES5 only -- this runs under node 0.10.
+          "use strict";
+
+          var fs = require( "fs" );
+
+          // node resolves a relative require() against the script's directory
+          // (/seal), not the cwd (/work), so the package must be addressed by
+          // absolute path.
+          var pkg = require( process.cwd() + "/package.json" );
+          var version = pkg.version;
+
+          var devFile = "dist/jquery.js";
+          var minFile = "dist/jquery.min.js";
+          var mapFile = "dist/jquery.min.map";
+
+          var cdnFolder = "dist/cdn";
+
+          var releaseFiles = {
+              "jquery-VER.js": devFile,
+              "jquery-VER.min.js": minFile,
+              "jquery-VER.min.map": mapFile,
+              "jquery.js": devFile,
+              "jquery.min.js": minFile,
+              "jquery.min.map": mapFile,
+              "jquery-latest.js": devFile,
+              "jquery-latest.min.js": minFile,
+              "jquery-latest.min.map": mapFile
+          };
+
+          if ( !fs.existsSync( cdnFolder ) ) {
+              fs.mkdirSync( cdnFolder );
+          }
+
+          Object.keys( releaseFiles ).forEach( function( key ) {
+              var text,
+                  builtFile = releaseFiles[ key ],
+                  unpathedFile = key.replace( /VER/g, version ),
+                  releaseFile = cdnFolder + "/" + unpathedFile;
+
+              if ( /\.map$/.test( releaseFile ) ) {
+
+                  // Map files need to reference the new uncompressed name;
+                  // assume that all files reside in the same directory.
+                  // "file":"jquery.min.js","sources":["jquery.js"]
+                  text = fs.readFileSync( builtFile, "utf8" )
+                      .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                          "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                          "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+                  fs.writeFileSync( releaseFile, text );
+
+              } else if ( /\.min\.js$/.test( releaseFile ) ) {
+
+                  // Remove the source map comment; it causes way too many problems.
+                  // Keep the map file in case DevTools allow manual association.
+                  text = fs.readFileSync( builtFile, "utf8" )
+                      .replace( /\/\/# sourceMappingURL=\S+/, "" );
+                  fs.writeFileSync( releaseFile, text );
+
+              } else if ( builtFile !== releaseFile ) {
+
+                  // Byte copy, equivalent to shelljs `cp -f`.
+                  fs.writeFileSync( releaseFile, fs.readFileSync( builtFile ) );
+              }
+
+              console.log( "wrote " + releaseFile );
+          } );
+          EOF
+          node --version
+          echo "--- make-cdn-copies.js written ---"
+          wc -l "$RUNNER_TEMP/seal/make-cdn-copies.js"
+
+      - name: Write the container build script
+        run: |
+          mkdir -p "$RUNNER_TEMP/seal"
+          cat > "$RUNNER_TEMP/seal/build.sh" <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          echo "=== toolchain ==="
+          node --version
+          npm --version
+
+          # 1. Registry time machine. npm 2.x needs all three settings: the
+          #    scoped _authToken carries the release timestamp and always-auth
+          #    makes npm 2.x actually send it on tarball fetches.
+          npm config set registry https://time-machines-npm.sealsecurity.io/
+          npm config set //time-machines-npm.sealsecurity.io/:_authToken 2014-05-01T18:05:32.863000Z
+          npm config set always-auth true
+
+          # 2. devDependencies, including grunt-cli@0.1.13 -> ./node_modules/.bin/grunt
+          npm install
+
+          # 3. Pin the embedded build date. build/tasks/build.js stamps
+          #    ( new Date() ).toISOString() into src/intro.js's `Date: @DATE`
+          #    header; src/intro.js itself ships in the tarball and must stay
+          #    byte-identical, so the pin belongs here and not in the source.
+          sed -i 's|^\([[:space:]]*\)\.replace( /@DATE/g, .*);[[:space:]]*$|\1.replace( /@DATE/g, "2014-05-01T17:42Z" );|' \
+              build/tasks/build.js
+          if ! grep -q '\.replace( /@DATE/g, "2014-05-01T17:42Z" );' build/tasks/build.js; then
+              echo "FATAL: @DATE pin did not land in build/tasks/build.js" >&2
+              grep -n "@DATE" build/tasks/build.js >&2
+              exit 1
+          fi
+          if grep -q "new Date()" build/tasks/build.js; then
+              echo "FATAL: build/tasks/build.js still calls new Date()" >&2
+              grep -n "new Date()" build/tasks/build.js >&2
+              exit 1
+          fi
+          echo "=== @DATE pinned ==="
+          grep -n "@DATE" build/tasks/build.js
+
+          # 3b. Pin the uglify banner year. The Gruntfile banner interpolates
+          #     grunt.template.today('yyyy'), which would stamp the current year
+          #     into dist/jquery.min.js instead of the release year 2014.
+          #     Gruntfile.js is excluded by .npmignore, so this never reaches the
+          #     tarball. No-op when the file already carries the literal pin.
+          sed -i "s|grunt\.template\.today('yyyy')|2014|g" Gruntfile.js
+          if grep -q "grunt.template.today" Gruntfile.js; then
+              echo "FATAL: banner year pin did not land in Gruntfile.js" >&2
+              grep -n "grunt.template.today" Gruntfile.js >&2
+              exit 1
+          fi
+          echo "=== banner year pinned ==="
+          grep -n "2005, " Gruntfile.js
+
+          # 4. build/tasks/build.js appends process.env.COMMIT to the embedded
+          #    version string when it is set.
+          unset COMMIT
+          if [ -n "${COMMIT:-}" ]; then
+              echo "FATAL: COMMIT is set to '${COMMIT}'" >&2
+              exit 1
+          fi
+
+          # 5. Default grunt task: jsonlint, build:*:*, lint, uglify, dist:*,
+          #    compare_size. Regenerates dist/jquery.js, dist/jquery.min.js and
+          #    dist/jquery.min.map.
+          #
+          #    Never run `bower` / the bowercopy task: src/sizzle and
+          #    test/libs/{qunit,require.js,sinon} are already vendored, and
+          #    .npmignore does not exclude bower_components/, so a bower run
+          #    would add entries to the tarball.
+          ./node_modules/.bin/grunt
+
+          echo "=== built dist ==="
+          ls -l dist
+          head -14 dist/jquery.js
+          head -c 100 dist/jquery.min.js; echo
+
+          # 6. The nine dist/cdn/* files. No Grunt task produces these.
+          node /seal/make-cdn-copies.js
+          ls -l dist/cdn
+          test "$( ls -1 dist/cdn | wc -l )" = "9"
+
+          # 7. .npmignore has no entry for .github and npm 2.x has no default
+          #    rule for it, so leaving it in place packs this workflow as an
+          #    extra tarball entry and byte-comparison fails.
+          rm -rf .github
+
+          # Hand the workspace back to the runner user BEFORE packing. The
+          # container writes dist/cdn/* as root, and npm preserves each file's
+          # uid/gid in the tar entries, so packing first would leave those nine
+          # entries owned by 0/0 while the rest of the tree is the runner user.
+          # This also keeps upload-artifact and a later actions/checkout cleanup
+          # from tripping over root-owned files.
+          if [ -n "${HOST_UID:-}" ]; then
+              chown -R "${HOST_UID}:${HOST_GID:-${HOST_UID}}" /work
+          fi
+
+          # 8. Pack. npm 2.15.1 keeps .npmignore inside the tarball; a modern
+          #    npm omits it, which is why the whole build runs in this image.
+          npm pack
+
+          ls -l jquery-1.11.1.tgz
+          echo "=== tarball entry count ==="
+          tar tzf jquery-1.11.1.tgz | wc -l
+          echo "=== .npmignore present? ==="
+          tar tzf jquery-1.11.1.tgz | grep -x "package/.npmignore"
+          echo "=== .github absent? ==="
+          if tar tzf jquery-1.11.1.tgz | grep -q "\.github"; then
+              echo "FATAL: .github packed into the tarball" >&2
+              exit 1
+          fi
+          echo "ok"
+
+          if [ -n "${HOST_UID:-}" ]; then
+              chown "${HOST_UID}:${HOST_GID:-${HOST_UID}}" jquery-1.11.1.tgz
+          fi
+          EOF
+          chmod +x "$RUNNER_TEMP/seal/build.sh"
+          echo "--- build.sh written ---"
+
+      # The build runs inside node:0.10-wheezy (npm 2.15.1), not on the runner:
+      # a modern npm's `npm pack` OMITS .npmignore, but the reference tarball
+      # contains it. No apt installs are needed in this image.
+      - name: Build and pack in node:0.10-wheezy
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/work \
+            -v "$RUNNER_TEMP/seal":/seal \
+            -w /work \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
+            node:0.10-wheezy \
+            bash /seal/build.sh
+
+      - name: Upload the sealed tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: jquery-1.11.1.tgz
+          path: jquery-1.11.1.tgz
+          if-no-files-found: error

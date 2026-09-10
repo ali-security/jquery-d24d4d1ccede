@@ -1,3 +1,45 @@
 language: node_js
+dist: focal
 node_js:
 - '0.10'
+
+# The pristine node 0.10 leg above runs "npm test", i.e. the grunt default task
+# (jsonlint / build / jshint / jscs / uglify / dist / compare_size), off the
+# live npm registry. That is lint-and-build only and produces no test-runner
+# output, so the leg below runs the real browser QUnit suite (test/index.html)
+# in headless Chrome.
+jobs:
+  include:
+  - name: "QUnit test suite (headless Chrome)"
+    node_js: '20'
+    addons:
+      chrome: stable
+    install:
+    # dist/ has to be produced by the original toolchain, which only installs
+    # under node 0.10. grunt-cli 0.1.13 is a devDependency, so
+    # ./node_modules/.bin/grunt exists without a global install.
+    - nvm install 0.10 && nvm use 0.10 && npm install && ./node_modules/.bin/grunt
+    - nvm use 20
+    # puppeteer-core is installed in its own tree on purpose: reifying jQuery's
+    # package.json under npm 10 would tear down the node 0.10 install. The
+    # runner picks it up through NODE_PATH below.
+    - mkdir -p /tmp/driver && cd /tmp/driver && npm init -y && npm install puppeteer-core && cd "$TRAVIS_BUILD_DIR"
+    script:
+    # PHP serves the suite because the ajax module requests test/data/*.php.
+    # PHP_CLI_SERVER_WORKERS is load-bearing: a single-process "php -S"
+    # serializes requests, starves the fixture iframe loads and spuriously
+    # fails "core: document ready when jQuery loaded asynchronously (#13655)"
+    # and "core: Tolerating alias-masked DOM properties (#14074)".
+    - PHP_CLI_SERVER_WORKERS=10 php -S 127.0.0.1:8000 -t . > /tmp/php-server.log 2>&1 &
+    - sleep 5
+    - curl -sSf -o /dev/null "http://127.0.0.1:8000/test/index.html"
+    # "?dev" is required: test/jquery.js otherwise loads dist/jquery.min.js.
+    # Both exclusions are environment-dependent and deterministic:
+    #   ajax #14379 fires a synchronous XHR from a window unload handler, which
+    #     Chrome has forbidden during page dismissal since ~v80;
+    #   offset fractions asserts that a fractional offset round-trips exactly,
+    #     but Blink snaps to 1/64 px and reads back 999.984375 for 1000.
+    - >-
+      SEAL_SKIP_TESTS="ajax: #14379 - jQuery.ajax() on unload|offset: fractions (see #7730 and #7885)"
+      NODE_PATH=/tmp/driver/node_modules
+      node test/seal-browser-runner.js
